@@ -1,0 +1,9 @@
+flask
+pillow
+pytesseract
+pdf2image
+transformers==4.35.0
+torch
+torchvision
+torchaudio
+datasets==2.12.0

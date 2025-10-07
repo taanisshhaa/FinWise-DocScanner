@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FinWise — Document Risk Analyzer</title>
+  <style>
+    body{font-family:"Inter",Arial,sans-serif;background:#f5f6fa;color:#222;margin:0;padding:30px}
+    h1{font-size:1.8rem;margin-bottom:10px}
+    .container{max-width:1000px;margin:0 auto}
+    .card{background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.08);padding:20px 28px;margin-bottom:24px}
+    #uploadForm{display:flex;flex-direction:column;gap:12px}
+    input[type=file]{padding:8px;border:1px solid #ddd;border-radius:6px;background:#fafafa}
+    button{align-self:flex-start;background:#0066ff;color:#fff;font-weight:600;border:none;border-radius:6px;padding:10px 16px;cursor:pointer;transition:.2s ease}
+    button:hover{background:#0050cc}
+    #status{font-size:.9rem;color:#555;margin-top:4px}
+    .badge{display:inline-block;padding:8px 16px;border-radius:8px;font-weight:600;color:#fff;font-size:1rem;margin-bottom:10px;box-shadow:0 1px 4px rgba(0,0,0,.15)}
+    #pages{display:flex;flex-direction:column;align-items:center;gap:20px}
+    .page-container{position:relative;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+    .page-container img{display:block;max-width:100%;height:auto}
+    .page-canvas{position:absolute;left:0;top:0;pointer-events:none}
+    pre{background:#f8f8f8;border:1px solid #eee;border-radius:8px;padding:10px;overflow-x:auto}
+    .tooltip{position:fixed;background:rgba(0,0,0,.85);color:#fff;padding:6px 8px;border-radius:6px;display:none;z-index:9999;font-size:.9rem}
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>FinWise Document Risk Analyzer</h1>
+
+  <div class="card">
+    <form id="uploadForm">
+      <input id="fileInput" name="file" type="file" accept=".pdf,image/*" required>
+      <button type="submit">Upload & Analyze</button>
+    </form>
+    <div id="status">Choose a PDF or image and click "Upload & Analyze".</div>
+  </div>
+
+  <div id="results" style="display:none">
+    <div class="card">
+      <h3>Risk Summary</h3>
+      <div id="riskScore"></div>
+      <ul id="riskReasons"></ul>
+    </div>
+
+    <div class="card">
+      <h3>Document Pages</h3>
+      <div id="pages"></div>
+    </div>
+
+    <div class="card">
+      <h3>Extracted Fields</h3>
+      <pre id="regexFields"></pre>
+    </div>
+  </div>
+
+  <div class="tooltip" id="tooltip"></div>
+</div>
+
+<script>
+const status=document.getElementById('status'),results=document.getElementById('results'),
+pagesDiv=document.getElementById('pages'),riskScoreDiv=document.getElementById('riskScore'),
+riskReasons=document.getElementById('riskReasons'),regexFields=document.getElementById('regexFields'),
+tooltip=document.getElementById('tooltip');
+
+function getRiskColor(risk){
+  const rsk=Math.max(0,Math.min(100,risk));
+  let r,g;
+  if(rsk<50){r=Math.round((rsk/50)*255);g=255;}
+  else{r=255;g=Math.round(255-((rsk-50)/50)*255);}
+  return`rgb(${r},${g},0)`;
+}
+
+document.getElementById('uploadForm').addEventListener('submit',async ev=>{
+  ev.preventDefault();
+  const f=document.getElementById('fileInput').files[0];
+  if(!f){alert('Please choose a file');return;}
+  status.textContent='Analyzing... please wait.';results.style.display='none';
+  const fd=new FormData();fd.append('file',f);
+  try{
+    const resp=await fetch('/analyze',{method:'POST',body:fd});
+    if(!resp.ok)throw new Error(await resp.text());
+    const data=await resp.json();status.textContent='Analysis complete.';showResults(data);
+  }catch(err){console.error(err);status.textContent='Error: '+err.message;}
+});
+
+function showResults(data){
+  results.style.display='block';
+  const color=getRiskColor(data.risk_score);
+  riskScoreDiv.innerHTML=`<span class="badge" style="background:${color}">Risk Score: ${data.risk_score}</span>`;
+  riskReasons.innerHTML=(data.risk_reasons||[]).map(r=>`<li>${r}</li>`).join('');
+  regexFields.textContent=JSON.stringify(data.regex_fields||{},null,2);
+  const images=data.page_images||[],entities=data.entities_model||[];
+  const regexText=JSON.stringify(data.regex_fields||{},null,2).toLowerCase();
+  const risk=data.risk_score||0;
+  pagesDiv.innerHTML='';
+  images.forEach(p=>{
+    const c=document.createElement('div');c.className='page-container';
+    const img=document.createElement('img');img.src='data:image/png;base64,'+p.image;img.alt='page '+p.page;c.appendChild(img);pagesDiv.appendChild(c);
+    img.addEventListener('load',()=>{
+      const canvas=document.createElement('canvas');canvas.className='page-canvas';
+      canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;
+      canvas.style.width=img.clientWidth+'px';canvas.style.height=img.clientHeight+'px';
+      c.appendChild(canvas);
+      const ents=entities.filter(e=>e.page===p.page);
+      drawEntities(canvas,ents,regexText,risk);
+      canvas.addEventListener('mousemove',ev=>{
+        const found=findEntityAt(canvas,ents,ev,regexText,risk);
+        if(found)showTooltip(ev.clientX,ev.clientY,`${found.label}: ${found.text}`);else hideTooltip();
+      });
+    });
+  });
+}
+
+function drawEntities(canvas,ents,regexText,risk){
+  if(risk<=0)return;
+  const ctx=canvas.getContext('2d');ctx.lineWidth=Math.max(2,Math.round(canvas.width/800));
+  const highRisk=ents.filter(e=>regexText.includes((e.text||"").toLowerCase()));
+  highRisk.forEach(e=>drawBox(ctx,e.bbox,'rgba(255,0,0,0.85)','rgba(255,0,0,0.18)'));
+  const remaining=ents.filter(e=>!regexText.includes((e.text||"").toLowerCase()));
+  const portion=Math.min(1,risk/100);
+  const count=Math.floor(remaining.length*portion);
+  const sampled=shuffle(remaining).slice(0,count);
+  sampled.forEach(e=>drawBox(ctx,e.bbox,'rgba(255,0,0,0.5)','rgba(255,0,0,0.08)'));
+}
+
+function drawBox(ctx,b,stroke,fill){
+  ctx.strokeStyle=stroke;ctx.fillStyle=fill;
+  ctx.strokeRect(b[0],b[1],b[2]-b[0],b[3]-b[1]);
+  ctx.fillRect(b[0],b[1],b[2]-b[0],b[3]-b[1]);
+}
+
+function shuffle(arr){const a=arr.slice();for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;}
+
+function findEntityAt(canvas,ents,ev,regexText,risk){
+  const rect=canvas.getBoundingClientRect(),sx=canvas.width/canvas.clientWidth,sy=canvas.height/canvas.clientHeight;
+  const x=(ev.clientX-rect.left)*sx,y=(ev.clientY-rect.top)*sy;
+  const portion=Math.min(1,risk/100);
+  return ents.find(e=>{
+    const b=e.bbox,match=regexText.includes((e.text||"").toLowerCase());
+    const included=match||(Math.random()<portion);
+    return included&&x>=b[0]&&x<=b[2]&&y>=b[1]&&y<=b[3];
+  });
+}
+
+function showTooltip(x,y,txt){tooltip.style.left=(x+10)+'px';tooltip.style.top=(y+10)+'px';tooltip.textContent=txt;tooltip.style.display='block';}
+function hideTooltip(){tooltip.style.display='none';}
+</script>
+</body>
+</html>
